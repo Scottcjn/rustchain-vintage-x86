@@ -533,7 +533,13 @@ static void classify_arch(struct hwinfo *hw)
     char b[96];
     str_lower(b, hw->cpu, sizeof(b));
 
-    if (hw->cpu_family == 4 || strstr(b, "486")) {
+    if (hw->cpu_family == 4 || (hw->cpu_family < 5 && strstr(b, "486"))) {
+        /* Gate the brand-string "486" match on an old family. A real 486 is
+         * family 4 (already covered); no family >= 5 chip is a 486. Without
+         * the guard, a modern CPU whose model *number* contains "486"
+         * (e.g. Intel Core i7-4860HQ, family 6) was tagged "486" -- the most
+         * vintage / highest-bonus tier -- with a passing timing fingerprint,
+         * defeating the anti-fraud intent the family-6 branches below enforce. */
         strcpy(hw->arch, "486");
     } else if (hw->cpu_family == 6 && (strstr(b, "pentium iii") || strstr(b, "pentium 3"))) {
         strcpy(hw->arch, "pentium3");
@@ -959,6 +965,33 @@ static int selftest(void)
         if (e.stdev_ns != 250000ULL) { printf("  FAIL stdev\n"); fails++; }
         if (e.cv_ppm != 263157ULL) { printf("  FAIL cv\n"); fails++; }
         if (!clock_drift_passed(&e)) { printf("  FAIL drift-pass\n"); fails++; }
+    }
+
+    printf("arch classification:\n");
+    {
+        struct hwinfo hw;
+        int j;
+        static const struct { const char *cpu; int fam; const char *want; } cav[] = {
+            { "AMD-K6(tm) 3D processor",                   5, "retro"       },
+            { "Intel 80486DX2",                            4, "486"         },
+            { "Cyrix 5x86",                                4, "486"         },
+            { "Pentium III (Coppermine)",                  6, "pentium3"    },
+            { "Pentium II (Deschutes)",                    6, "pentium2"    },
+            { "Pentium Pro",                               6, "pentium_pro" },
+            /* modern chip whose model NUMBER contains "486": must NOT get a
+             * vintage tier via the brand-substring path (fam-6, "4860"). */
+            { "Intel(R) Core(TM) i7-4860HQ CPU @ 2.40GHz", 6, "modern"      }
+        };
+        for (j = 0; j < (int)(sizeof(cav) / sizeof(cav[0])); j++) {
+            memset(&hw, 0, sizeof(hw));
+            strncpy(hw.cpu, cav[j].cpu, sizeof(hw.cpu) - 1);
+            hw.cpu_family = cav[j].fam;
+            classify_arch(&hw);
+            if (strcmp(hw.arch, cav[j].want)) {
+                printf("  FAIL %s -> %s (want %s)\n", cav[j].cpu, hw.arch, cav[j].want);
+                fails++;
+            }
+        }
     }
 
     printf("payload build + brace balance:\n");
