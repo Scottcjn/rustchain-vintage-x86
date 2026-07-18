@@ -801,7 +801,7 @@ static int http_request(const char *host, int port,
     sa.sin_port = htons((unsigned short)port);
 
     sa.sin_addr.s_addr = inet_addr(host);
-    if (sa.sin_addr.s_addr == (in_addr_t)(-1)) {
+    if (sa.sin_addr.s_addr == (unsigned long)(-1)) {
         struct hostent *he = gethostbyname(host);
         if (!he) {
             printf("[FAIL] cannot resolve %s\n", host);
