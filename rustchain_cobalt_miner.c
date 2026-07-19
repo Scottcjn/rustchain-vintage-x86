@@ -311,13 +311,31 @@ static unsigned long long calibrate_tsc_hz(void)
     return (unsigned long long)((double)dc / secs);
 }
 
-static void collect_entropy(struct entropy_info *e)
+static void collect_entropy(struct entropy_info *e, int has_tsc)
 {
     unsigned long long hz;
     int i, j;
     volatile unsigned long acc = 0;
 
     memset(e, 0, sizeof(*e));
+
+    /*
+     * RDTSC (opcode 0F 31) is a Pentium/K6-and-up instruction. On a genuine
+     * 486 -- family 4, which we detect and even print as "TSC: no" -- it is
+     * not implemented and executing it faults with SIGILL. The 486 is a
+     * documented target (README arch table: family 4 -> "486"), so calling
+     * calibrate_tsc_hz()/read_tsc() unconditionally crashes the miner there.
+     * Degrade honestly instead: no cycle counter means no timing evidence, so
+     * leave timer_ok = 0 and emit no samples. clock_drift_passed() then fails
+     * server-side (the honest outcome for a chip that cannot be timed), rather
+     * than the process dying on an illegal instruction.
+     */
+    if (!has_tsc) {
+        e->sample_count = 0;
+        e->timer_ok = 0;
+        return;
+    }
+
     e->sample_count = ENT_SAMPLES;
     e->timer_ok = 1;
 
@@ -888,7 +906,10 @@ static int attest_once(const char *host, int port,
     }
     printf("[OK] got nonce\n");
 
-    collect_entropy(&ent);
+    if (!hw->has_tsc)
+        printf("[WARN] no RDTSC on this CPU (pre-Pentium); timing fingerprint "
+               "unavailable, attestation will be flagged\n");
+    collect_entropy(&ent, hw->has_tsc);
     if (build_payload(payload, sizeof(payload), hw, wallet, miner_id,
                       nonce, &ent) < 0) {
         printf("[FAIL] payload too large\n");
@@ -959,6 +980,30 @@ static int selftest(void)
         if (e.stdev_ns != 250000ULL) { printf("  FAIL stdev\n"); fails++; }
         if (e.cv_ppm != 263157ULL) { printf("  FAIL cv\n"); fails++; }
         if (!clock_drift_passed(&e)) { printf("  FAIL drift-pass\n"); fails++; }
+    }
+
+    printf("no-RDTSC CPU (486) degrades without executing RDTSC:\n");
+    {
+        struct entropy_info e;
+        static char payload[PAYLOAD_MAX];
+        struct hwinfo hw486;
+        /* has_tsc = 0 -> must NOT run rdtsc, must report an unusable timer */
+        collect_entropy(&e, 0);
+        if (e.timer_ok != 0) { printf("  FAIL timer_ok must be 0\n"); fails++; }
+        if (e.sample_count != 0) { printf("  FAIL sample_count must be 0\n"); fails++; }
+        if (clock_drift_passed(&e)) { printf("  FAIL clock_drift must fail with no timer\n"); fails++; }
+        /* the resulting payload must still be well-formed (no div-by-zero, no crash) */
+        memset(&hw486, 0, sizeof(hw486));
+        strcpy(hw486.family, "x86"); strcpy(hw486.arch, "486");
+        strcpy(hw486.machine, "i486"); strcpy(hw486.cpu, "486 DX/2");
+        strcpy(hw486.vendor, "GenuineIntel"); hw486.cpu_family = 4; hw486.has_tsc = 0;
+        hw486.cores = 1; strcpy(hw486.hostname, "i486");
+        strcpy(hw486.cpu_sig, "00000000000000000000000000000000deadbeef");
+        if (build_payload(payload, sizeof(payload), &hw486, "w", "w", "nonce", &e) <= 0) {
+            printf("  FAIL 486 payload build\n"); fails++;
+        } else if (!strstr(payload, "\"sample_count\":0")) {
+            printf("  FAIL 486 payload sample_count\n"); fails++;
+        }
     }
 
     printf("payload build + brace balance:\n");
@@ -1057,7 +1102,7 @@ int main(int argc, char **argv)
     if (dry_run) {
         static char payload[PAYLOAD_MAX];
         struct entropy_info ent;
-        collect_entropy(&ent);
+        collect_entropy(&ent, hw.has_tsc);
         if (build_payload(payload, sizeof(payload), &hw, wallet, wallet,
                           "dry-run-nonce", &ent) < 0) {
             printf("[FAIL] payload too large\n");
