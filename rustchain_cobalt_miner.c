@@ -3,14 +3,16 @@
  *                            (AMD K6-2, i586, Cobalt Linux 2.2 / glibc 2.1.3)
  *
  * Single file, no external deps beyond libc. Detects the CPU from
- * /proc/cpuinfo, times a busy loop with RDTSC for the clock-drift
- * fingerprint, reads MACs via ioctl (kernel 2.2 has no sysfs), then POSTs
- * an attestation JSON to the RustChain node over plain HTTP.
+ * /proc/cpuinfo, times a busy loop with RDTSC when the CPU advertises it
+ * or a calibrated libc wall-clock loop otherwise, reads MACs via ioctl
+ * (kernel 2.2 has no sysfs), then POSTs an attestation JSON to the
+ * RustChain node over plain HTTP.
  *
  * Flags:
  *   --test-only        print hardware detection, no network
  *   --dry-run          print the exact JSON payload, no network
  *   --self-test        run SHA-1 / math self-tests and exit
+ *   --force-loop-timing use the non-RDTSC timing path even when available
  *   --once             attest one time and exit
  *   --node host:port   node address (default 50.28.86.131:8088)
  *   --wallet id        wallet / miner id (default cobalt-qube3-scott)
@@ -31,6 +33,14 @@
  * C89 / gcc 2.95 rules: all declarations at the top of a block, no // comments.
  */
 
+/* Expose the historic BSD socket/ioctl interfaces under modern -ansi. */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+#ifndef _BSD_SOURCE
+#define _BSD_SOURCE 1
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,9 +53,10 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <net/if.h>
+#include <sys/time.h>
 #include <sys/utsname.h>
 
-#define MINER_VERSION "1.0"
+#define MINER_VERSION "1.1"
 #define DEFAULT_NODE_HOST "50.28.86.131"
 #define DEFAULT_NODE_PORT 8088
 #define DEFAULT_WALLET "cobalt-qube3-scott"
@@ -194,6 +205,7 @@ struct entropy_info {
     unsigned long samples_ns[ENT_SAMPLES];
     int sample_count;
     int timer_ok;
+    char timing_source[8];
     unsigned long long mean_ns;
     unsigned long long variance_ns;
     unsigned long long stdev_ns;
@@ -273,10 +285,67 @@ static int clock_drift_passed(const struct entropy_info *e)
 }
 
 /* ------------------------------------------------------------------ */
-/* x86 timing: RDTSC busy-loop samples -> nanoseconds                  */
+/* x86 timing: RDTSC when advertised, calibrated libc loop otherwise  */
 /* ------------------------------------------------------------------ */
 
-/* Read the cycle counter. Present on Pentium/K6 and up. */
+/*
+ * Detect CPUID without executing it first.  x86-64 guarantees CPUID.  On
+ * 32-bit x86 we toggle EFLAGS.ID; 386 and early 486 chips leave it fixed.
+ * This avoids a SIGILL handler and works with the gcc 2.x inline assembler.
+ */
+static int cpu_has_cpuid(void)
+{
+#if defined(__x86_64__)
+    return 1;
+#else
+    unsigned long before, after;
+
+    __asm__ __volatile__(
+        "pushfl\n\t"
+        "popl %0\n\t"
+        "movl %0,%1\n\t"
+        "xorl $0x200000,%1\n\t"
+        "pushl %1\n\t"
+        "popfl\n\t"
+        "pushfl\n\t"
+        "popl %1\n\t"
+        "pushl %0\n\t"
+        "popfl"
+        : "=&r"(before), "=&r"(after)
+        :
+        : "cc");
+    return ((before ^ after) & 0x200000UL) != 0;
+#endif
+}
+
+/* RDTSC is used only when CPUID leaf 1 explicitly advertises it. */
+static int cpu_supports_tsc(int cpu_family)
+{
+    unsigned int eax, ebx, ecx, edx;
+
+    /* No family-4 CPU implements RDTSC, including CPUID-capable 486s. */
+    if (cpu_family > 0 && cpu_family <= 4)
+        return 0;
+    if (!cpu_has_cpuid())
+        return 0;
+
+    eax = 0;
+    ecx = 0;
+    __asm__ __volatile__("cpuid"
+                         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                         : "0"(eax), "2"(ecx));
+    if (eax < 1U)
+        return 0;
+
+    eax = 1;
+    ecx = 0;
+    __asm__ __volatile__("cpuid"
+                         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                         : "0"(eax), "2"(ecx));
+    return (edx & 0x00000010U) ? 1 : 0;
+}
+
+/* Read the cycle counter, after cpu_supports_tsc() has approved it. */
 static unsigned long long read_tsc(void)
 {
     unsigned int lo, hi;
@@ -286,11 +355,9 @@ static unsigned long long read_tsc(void)
 
 /*
  * Estimate the TSC rate (cycles per second) by spinning for a wall-clock
- * interval measured with gettimeofday-equivalent time(). We use a short
- * calibration against a 200ms busy interval measured via clock(). Falls
- * back to a nominal 450MHz (the K6-2/450 in this box) if calibration is
- * degenerate; the exact rate only scales the reported ns, and the server
- * cares about the *variance*, not the absolute value.
+ * interval measured with clock(). Falls back to a nominal 450MHz (the
+ * K6-2/450 in the original box) if calibration is degenerate; the exact
+ * rate only scales the reported ns, and variance is the useful signal.
  */
 static unsigned long long calibrate_tsc_hz(void)
 {
@@ -300,7 +367,7 @@ static unsigned long long calibrate_tsc_hz(void)
 
     t0 = read_tsc();
     c0 = clock();
-    /* busy-wait ~150ms of CPU time */
+    /* busy-wait about 150ms of CPU time */
     while (((c1 = clock()) - c0) < (clock_t)(CLOCKS_PER_SEC / 7))
         ;
     t1 = read_tsc();
@@ -311,7 +378,7 @@ static unsigned long long calibrate_tsc_hz(void)
     return (unsigned long long)((double)dc / secs);
 }
 
-static void collect_entropy(struct entropy_info *e)
+static void collect_entropy_rdtsc(struct entropy_info *e)
 {
     unsigned long long hz;
     int i, j;
@@ -320,6 +387,7 @@ static void collect_entropy(struct entropy_info *e)
     memset(e, 0, sizeof(*e));
     e->sample_count = ENT_SAMPLES;
     e->timer_ok = 1;
+    strcpy(e->timing_source, "rdtsc");
 
     hz = calibrate_tsc_hz();
     if (hz == 0) hz = 450000000ULL;
@@ -336,6 +404,140 @@ static void collect_entropy(struct entropy_info *e)
     }
 
     entropy_compute_stats(e);
+}
+
+/* Keep the loop observable even under -O2 on old and new compilers. */
+static volatile unsigned long loop_timing_sink = 0;
+
+static void run_timing_loop(unsigned long iterations, unsigned long salt)
+{
+    volatile unsigned long acc;
+    unsigned long i;
+
+    acc = salt ^ 0x9E3779B9UL;
+    for (i = 0; i < iterations; i++)
+        acc = (acc * 1664525UL + 1013904223UL) ^ (i + salt);
+    loop_timing_sink ^= acc;
+}
+
+static unsigned long timeval_diff_us(const struct timeval *start,
+                                     const struct timeval *end)
+{
+    long sec, usec;
+
+    sec = (long)(end->tv_sec - start->tv_sec);
+    usec = (long)(end->tv_usec - start->tv_usec);
+    if (usec < 0) {
+        usec += 1000000L;
+        sec--;
+    }
+    if (sec < 0 || sec > 3600L)
+        return 0;
+    return (unsigned long)sec * 1000000UL + (unsigned long)usec;
+}
+
+/*
+ * Measure a loop with gettimeofday().  clock() is sampled at the same time
+ * and is used only when wall-clock resolution is too coarse or unavailable.
+ */
+static int measure_timing_loop(unsigned long iterations, unsigned long salt,
+                               unsigned long long *elapsed_ns)
+{
+    struct timeval tv0, tv1;
+    clock_t c0, c1;
+    unsigned long elapsed_us;
+    int have_tv;
+
+    c0 = clock();
+    have_tv = (gettimeofday(&tv0, (struct timezone *)0) == 0);
+    run_timing_loop(iterations, salt);
+    if (have_tv)
+        have_tv = (gettimeofday(&tv1, (struct timezone *)0) == 0);
+    c1 = clock();
+
+    if (have_tv) {
+        elapsed_us = timeval_diff_us(&tv0, &tv1);
+        if (elapsed_us > 0) {
+            *elapsed_ns = (unsigned long long)elapsed_us * 1000ULL;
+            return 1;
+        }
+    }
+
+    if (c0 != (clock_t)-1 && c1 != (clock_t)-1 && c1 > c0 &&
+        CLOCKS_PER_SEC > 0) {
+        *elapsed_ns = ((unsigned long long)(c1 - c0) * 1000000000ULL) /
+                      (unsigned long long)CLOCKS_PER_SEC;
+        return *elapsed_ns > 0;
+    }
+
+    *elapsed_ns = 0;
+    return 0;
+}
+
+/* Calibrate one sample to roughly 20ms so old, coarse clocks still tick. */
+static unsigned long calibrate_loop_iterations(void)
+{
+    unsigned long iterations;
+    unsigned long long elapsed_ns, scaled;
+    int attempt;
+
+    iterations = 50000UL;
+    for (attempt = 0; attempt < 10; attempt++) {
+        if (!measure_timing_loop(iterations, (unsigned long)attempt,
+                                 &elapsed_ns) || elapsed_ns == 0) {
+            if (iterations <= 25000000UL)
+                iterations *= 4UL;
+            else
+                iterations = 100000000UL;
+            continue;
+        }
+
+        if (elapsed_ns >= 10000000ULL && elapsed_ns <= 40000000ULL)
+            return iterations;
+
+        scaled = ((unsigned long long)iterations * 20000000ULL) / elapsed_ns;
+        if (scaled < 1000ULL)
+            scaled = 1000ULL;
+        if (scaled > 100000000ULL)
+            scaled = 100000000ULL;
+        if ((unsigned long)scaled == iterations)
+            return iterations;
+        iterations = (unsigned long)scaled;
+    }
+    return iterations;
+}
+
+static void collect_entropy_loop(struct entropy_info *e)
+{
+    unsigned long iterations;
+    unsigned long long elapsed_ns;
+    int i;
+
+    memset(e, 0, sizeof(*e));
+    e->sample_count = ENT_SAMPLES;
+    e->timer_ok = 1;
+    strcpy(e->timing_source, "loop");
+    iterations = calibrate_loop_iterations();
+
+    for (i = 0; i < ENT_SAMPLES; i++) {
+        if (!measure_timing_loop(iterations, (unsigned long)i, &elapsed_ns)) {
+            e->timer_ok = 0;
+            elapsed_ns = 0;
+        }
+        if (elapsed_ns > (unsigned long long)~0UL)
+            elapsed_ns = (unsigned long long)~0UL;
+        e->samples_ns[i] = (unsigned long)elapsed_ns;
+    }
+
+    entropy_compute_stats(e);
+}
+
+static void collect_entropy(struct entropy_info *e, int use_tsc)
+{
+    if (use_tsc)
+        collect_entropy_rdtsc(e);
+    else
+        collect_entropy_loop(e);
 }
 
 /* ------------------------------------------------------------------ */
@@ -423,7 +625,12 @@ static void detect_cpu(struct hwinfo *hw)
 
     flags[0] = '\0';
     cpuinfo_field(cpuinfo, "flags", flags, sizeof(flags));
-    hw->has_tsc = (strstr(flags, " tsc") || strncmp(flags, "tsc", 3) == 0) ? 1 : 0;
+    /*
+     * Do not trust a missing or synthetic /proc flag enough to execute
+     * RDTSC.  CPUID must exist and explicitly advertise feature bit 4.
+     * Family 4 is forced to the loop path even on late CPUID-capable 486s.
+     */
+    hw->has_tsc = cpu_supports_tsc(hw->cpu_family);
     /* honest VM check: kernel exposes "hypervisor" in flags under a VM */
     hw->has_hypervisor = strstr(flags, "hypervisor") ? 1 : 0;
 
@@ -482,7 +689,8 @@ static void detect_macs(struct hwinfo *hw)
         struct ifreq ir;
         unsigned char *m;
         memset(&ir, 0, sizeof(ir));
-        strncpy(ir.ifr_name, ifrbuf[i].ifr_name, IFNAMSIZ - 1);
+        memcpy(ir.ifr_name, ifrbuf[i].ifr_name, IFNAMSIZ);
+        ir.ifr_name[IFNAMSIZ - 1] = '\0';
         if (strcmp(ir.ifr_name, "lo") == 0)
             continue;
         if (ioctl(sock, SIOCGIFHWADDR, &ir) < 0)
@@ -604,6 +812,9 @@ static int build_fingerprint(char *out, int outlen,
     int emu_ok = !hw->has_hypervisor;
     int all_ok = clock_ok && emu_ok;
     int i, o = 0, len;
+    const char *timing_source;
+
+    timing_source = strcmp(e->timing_source, "rdtsc") == 0 ? "rdtsc" : "loop";
 
     for (i = 0; i < e->sample_count; i++)
         o += sprintf(samples_s + o, "%s%lu", i ? "," : "", e->samples_ns[i]);
@@ -623,7 +834,8 @@ static int build_fingerprint(char *out, int outlen,
                     "\"stdev_ns\":%s,"
                     "\"cv\":%s.%06lu,"
                     "\"drift_stdev\":%s,"
-                    "\"timer_source\":\"rdtsc\","
+                    "\"timer_source\":\"%s\","
+                    "\"timing_source\":\"%s\","
                     "\"samples_ns\":[%s]"
                 "}"
             "},"
@@ -643,6 +855,8 @@ static int build_fingerprint(char *out, int outlen,
         u64s(e->cv_ppm / 1000000ULL, cvw_s),
         (unsigned long)(e->cv_ppm % 1000000ULL),
         u64s(e->drift_stdev_ns, drift_s),
+        timing_source,
+        timing_source,
         samples_s,
         emu_ok ? "true" : "false",
         indicators_s);
@@ -801,13 +1015,13 @@ static int http_request(const char *host, int port,
     sa.sin_port = htons((unsigned short)port);
 
     sa.sin_addr.s_addr = inet_addr(host);
-    if (sa.sin_addr.s_addr == (unsigned long)(-1)) {
+    if (sa.sin_addr.s_addr == INADDR_NONE) {
         struct hostent *he = gethostbyname(host);
         if (!he) {
             printf("[FAIL] cannot resolve %s\n", host);
             return -1;
         }
-        memcpy(&sa.sin_addr, he->h_addr, 4);
+        memcpy(&sa.sin_addr, he->h_addr_list[0], 4);
     }
 
     s = socket(AF_INET, SOCK_STREAM, 0);
@@ -863,9 +1077,20 @@ static void print_detection(const struct hwinfo *hw)
     printf("\n");
 }
 
+static void print_timing(const struct entropy_info *e)
+{
+    char mean_s[24], stdev_s[24], drift_s[24];
+
+    printf("  Timing:    %s (%s)\n", e->timing_source,
+           e->timer_ok ? "timer ok" : "timer failed");
+    printf("  Mean ns:   %s  stdev: %s  drift stdev: %s\n",
+           u64s(e->mean_ns, mean_s), u64s(e->stdev_ns, stdev_s),
+           u64s(e->drift_stdev_ns, drift_s));
+}
+
 static int attest_once(const char *host, int port,
                        const char *wallet, const char *miner_id,
-                       const struct hwinfo *hw)
+                       const struct hwinfo *hw, int force_loop_timing)
 {
     static char resp[RESP_MAX];
     static char payload[PAYLOAD_MAX];
@@ -888,7 +1113,7 @@ static int attest_once(const char *host, int port,
     }
     printf("[OK] got nonce\n");
 
-    collect_entropy(&ent);
+    collect_entropy(&ent, hw->has_tsc && !force_loop_timing);
     if (build_payload(payload, sizeof(payload), hw, wallet, miner_id,
                       nonce, &ent) < 0) {
         printf("[FAIL] payload too large\n");
@@ -952,6 +1177,7 @@ static int selftest(void)
         memset(&e, 0, sizeof(e));
         e.sample_count = ENT_SAMPLES;
         e.timer_ok = 1;
+        strcpy(e.timing_source, "rdtsc");
         for (k = 0; k < ENT_SAMPLES; k++)
             e.samples_ns[k] = (k % 2) ? 1200000UL : 700000UL;
         entropy_compute_stats(&e);
@@ -961,7 +1187,7 @@ static int selftest(void)
         if (!clock_drift_passed(&e)) { printf("  FAIL drift-pass\n"); fails++; }
     }
 
-    printf("payload build + brace balance:\n");
+    printf("payload build + forced loop timing:\n");
     {
         struct hwinfo hw;
         struct entropy_info e;
@@ -978,6 +1204,7 @@ static int selftest(void)
 
         memset(&e, 0, sizeof(e));
         e.sample_count = ENT_SAMPLES; e.timer_ok = 1;
+        strcpy(e.timing_source, "rdtsc");
         for (i = 0; i < ENT_SAMPLES; i++) e.samples_ns[i] = (i % 2) ? 445000UL : 440000UL;
         entropy_compute_stats(&e);
 
@@ -989,13 +1216,29 @@ static int selftest(void)
         if (!strstr(payload, "\"arch\":\"retro\"")) { printf("  FAIL arch\n"); fails++; }
         if (!strstr(payload, "\"macs\":[\"00:10:e0:12:34:56\"]")) { printf("  FAIL macs\n"); fails++; }
         if (!strstr(payload, "\"timer_source\":\"rdtsc\"")) { printf("  FAIL timer\n"); fails++; }
+        if (!strstr(payload, "\"timing_source\":\"rdtsc\"")) { printf("  FAIL RDTSC source\n"); fails++; }
         if (strstr(payload, ":-")) { printf("  FAIL negative number\n"); fails++; }
+
+        collect_entropy(&e, 0);
+        if (strcmp(e.timing_source, "loop") != 0) { printf("  FAIL loop select\n"); fails++; }
+        if (!e.timer_ok || e.mean_ns == 0) { printf("  FAIL loop timer\n"); fails++; }
+        plen = build_payload(payload, sizeof(payload), &hw,
+                             "cobalt-qube3-scott", "cobalt-qube3-scott",
+                             "cafebabe1234", &e);
+        if (plen <= 0) { printf("  FAIL loop payload build\n"); fails++; }
+        if (!strstr(payload, "\"timer_source\":\"loop\"")) { printf("  FAIL legacy loop source\n"); fails++; }
+        if (!strstr(payload, "\"timing_source\":\"loop\"")) { printf("  FAIL loop source\n"); fails++; }
+        if (strstr(payload, "\"timing_source\":\"rdtsc\"")) { printf("  FAIL loop masquerade\n"); fails++; }
 
         for (i = 0; i < plen; i++) {
             char ch = payload[i];
             if (instr) { if (ch == '\\') i++; else if (ch == '"') instr = 0; }
-            else { if (ch == '"') instr = 1; else if (ch == '{') depth++;
-                   else if (ch == '}') depth--; if (depth < 0) bad = 1; }
+            else {
+                if (ch == '"') instr = 1;
+                else if (ch == '{') depth++;
+                else if (ch == '}') depth--;
+                if (depth < 0) bad = 1;
+            }
         }
         if (depth != 0 || bad || instr) { printf("  FAIL brace balance\n"); fails++; }
 
@@ -1017,6 +1260,7 @@ int main(int argc, char **argv)
     int port = DEFAULT_NODE_PORT;
     char wallet[96];
     int test_only = 0, dry_run = 0, once = 0, self_test = 0;
+    int force_loop_timing = 0;
     int i;
 
     strcpy(host, DEFAULT_NODE_HOST);
@@ -1026,6 +1270,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--test-only") == 0) test_only = 1;
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = 1;
         else if (strcmp(argv[i], "--self-test") == 0) self_test = 1;
+        else if (strcmp(argv[i], "--force-loop-timing") == 0) force_loop_timing = 1;
         else if (strcmp(argv[i], "--once") == 0) once = 1;
         else if (strcmp(argv[i], "--node") == 0 && i + 1 < argc) {
             char *colon;
@@ -1040,7 +1285,8 @@ int main(int argc, char **argv)
         }
         else {
             printf("usage: rustchain_cobalt [--test-only] [--dry-run] [--self-test]\n");
-            printf("                        [--once] [--node host:port] [--wallet id]\n");
+            printf("                        [--force-loop-timing] [--once]\n");
+            printf("                        [--node host:port] [--wallet id]\n");
             return 5;
         }
     }
@@ -1051,13 +1297,17 @@ int main(int argc, char **argv)
     detect_hardware(&hw);
     print_detection(&hw);
 
-    if (test_only)
-        return 0;
+    if (test_only) {
+        struct entropy_info ent;
+        collect_entropy(&ent, hw.has_tsc && !force_loop_timing);
+        print_timing(&ent);
+        return ent.timer_ok ? 0 : 10;
+    }
 
     if (dry_run) {
         static char payload[PAYLOAD_MAX];
         struct entropy_info ent;
-        collect_entropy(&ent);
+        collect_entropy(&ent, hw.has_tsc && !force_loop_timing);
         if (build_payload(payload, sizeof(payload), &hw, wallet, wallet,
                           "dry-run-nonce", &ent) < 0) {
             printf("[FAIL] payload too large\n");
@@ -1069,7 +1319,7 @@ int main(int argc, char **argv)
     }
 
     for (;;) {
-        attest_once(host, port, wallet, wallet, &hw);
+        attest_once(host, port, wallet, wallet, &hw, force_loop_timing);
         if (once)
             break;
         printf("[SLEEP] next attestation in %d minutes\n", POLL_SECONDS / 60);
