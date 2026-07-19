@@ -801,7 +801,16 @@ static int http_request(const char *host, int port,
     sa.sin_port = htons((unsigned short)port);
 
     sa.sin_addr.s_addr = inet_addr(host);
-    if (sa.sin_addr.s_addr == (unsigned long)(-1)) {
+    /*
+     * inet_addr() returns INADDR_NONE (0xFFFFFFFF) when host is not a dotted
+     * quad. Mask to 32 bits before comparing: s_addr is 32 bits, but on an
+     * LP64 host (the documented "gcc -m64" test build) `unsigned long` is 64
+     * bits, so `(unsigned long)(-1)` is 0xFFFFFFFFFFFFFFFF and never matches
+     * the 0x00000000FFFFFFFF failure value -- a hostname would then skip
+     * gethostbyname() and connect to 255.255.255.255. Masking is correct on
+     * both the ILP32 Qube target and LP64 hosts, and needs no in_addr_t type.
+     */
+    if ((sa.sin_addr.s_addr & 0xFFFFFFFFUL) == 0xFFFFFFFFUL) {
         struct hostent *he = gethostbyname(host);
         if (!he) {
             printf("[FAIL] cannot resolve %s\n", host);
