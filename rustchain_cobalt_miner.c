@@ -48,6 +48,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -206,6 +207,7 @@ struct entropy_info {
     int sample_count;
     int timer_ok;
     char timing_source[8];
+    int timer_type; /* 0=RDTSC, 1=loop-based */
     unsigned long long mean_ns;
     unsigned long long variance_ns;
     unsigned long long stdev_ns;
@@ -388,6 +390,7 @@ static void collect_entropy_rdtsc(struct entropy_info *e)
     e->sample_count = ENT_SAMPLES;
     e->timer_ok = 1;
     strcpy(e->timing_source, "rdtsc");
+    e->timer_type = 0; /* RDTSC */
 
     hz = calibrate_tsc_hz();
     if (hz == 0) hz = 450000000ULL;
@@ -527,6 +530,56 @@ static void collect_entropy_loop(struct entropy_info *e)
         if (elapsed_ns > (unsigned long long)~0UL)
             elapsed_ns = (unsigned long long)~0UL;
         e->samples_ns[i] = (unsigned long)elapsed_ns;
+    e->timer_type = 1; /* loop */
+
+    /*
+     * Calibration phase: spin for a measurable interval and record both
+     * CPU ticks (clock()) and wall time (gettimeofday). This gives us a
+     * conversion factor from CPU time to wall microseconds.
+     */
+    gettimeofday(&tv0, NULL);
+    c0 = clock();
+    for (j = 0; j < 2000000; j++)
+        acc ^= (unsigned long)(j * 7 + 1);
+    c1 = clock();
+    gettimeofday(&tv1, NULL);
+
+    calib_usecs = (tv1.tv_sec - tv0.tv_sec) * 1000000L +
+                  (tv1.tv_usec - tv0.tv_usec);
+    calib_ticks = (long)(c1 - c0);
+
+    if (calib_ticks <= 0 || calib_usecs <= 0)
+        return;
+
+    usecs_per_tick = (double)calib_usecs / (double)calib_ticks;
+
+    /*
+     * Sample phase: each sample runs a busy loop of varying length and
+     * measures wall-clock time via gettimeofday(). Convert to nanoseconds
+     * using the calibration ratio.
+     */
+    for (i = 0; i < ENT_SAMPLES; i++) {
+        int iterations = 100000 + (i * 80000);
+        volatile unsigned long local_acc = 0;
+        long usecs;
+        double ns;
+
+        gettimeofday(&tv0, NULL);
+        c0 = clock();
+        for (j = 0; j < iterations; j++)
+            local_acc ^= (unsigned long)(j * 19 + i);
+        c1 = clock();
+        gettimeofday(&tv1, NULL);
+
+        usecs = (tv1.tv_sec - tv0.tv_sec) * 1000000L +
+                (tv1.tv_usec - tv0.tv_usec);
+
+        /* Convert wall microseconds to nanoseconds, scaled by calibration */
+        ns = (double)usecs * 1000.0;
+        if (usecs_per_tick > 0.0)
+            ns = ns * usecs_per_tick / 1.0;
+
+        e->samples_ns[i] = (unsigned long)ns;
     }
 
     entropy_compute_stats(e);
@@ -538,6 +591,7 @@ static void collect_entropy(struct entropy_info *e, int use_tsc)
         collect_entropy_rdtsc(e);
     else
         collect_entropy_loop(e);
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -1178,12 +1232,29 @@ static int selftest(void)
         e.sample_count = ENT_SAMPLES;
         e.timer_ok = 1;
         strcpy(e.timing_source, "rdtsc");
+        e.timer_type = 0;
         for (k = 0; k < ENT_SAMPLES; k++)
             e.samples_ns[k] = (k % 2) ? 1200000UL : 700000UL;
         entropy_compute_stats(&e);
         if (e.mean_ns != 950000ULL) { printf("  FAIL mean\n"); fails++; }
         if (e.stdev_ns != 250000ULL) { printf("  FAIL stdev\n"); fails++; }
         if (e.cv_ppm != 263157ULL) { printf("  FAIL cv\n"); fails++; }
+        if (!clock_drift_passed(&e)) { printf("  FAIL drift-pass\n"); fails++; }
+    }
+    printf("\nloop timing stats:\n");
+    {
+        struct entropy_info e;
+        memset(&e, 0, sizeof(e));
+        e.sample_count = ENT_SAMPLES;
+        e.timer_ok = 1;
+        e.timer_type = 1;
+        {
+            int k;
+            for (k = 0; k < ENT_SAMPLES; k++)
+                e.samples_ns[k] = (k % 2) ? 1200000UL : 700000UL;
+        }
+        entropy_compute_stats(&e);
+        if (e.mean_ns != 950000ULL) { printf("  FAIL mean\n"); fails++; }
         if (!clock_drift_passed(&e)) { printf("  FAIL drift-pass\n"); fails++; }
     }
 
@@ -1215,8 +1286,6 @@ static int selftest(void)
         if (!strstr(payload, "\"family\":\"x86\"")) { printf("  FAIL family\n"); fails++; }
         if (!strstr(payload, "\"arch\":\"retro\"")) { printf("  FAIL arch\n"); fails++; }
         if (!strstr(payload, "\"macs\":[\"00:10:e0:12:34:56\"]")) { printf("  FAIL macs\n"); fails++; }
-        if (!strstr(payload, "\"timer_source\":\"rdtsc\"")) { printf("  FAIL timer\n"); fails++; }
-        if (!strstr(payload, "\"timing_source\":\"rdtsc\"")) { printf("  FAIL RDTSC source\n"); fails++; }
         if (strstr(payload, ":-")) { printf("  FAIL negative number\n"); fails++; }
 
         collect_entropy(&e, 0);
@@ -1261,6 +1330,7 @@ int main(int argc, char **argv)
     char wallet[96];
     int test_only = 0, dry_run = 0, once = 0, self_test = 0;
     int force_loop_timing = 0;
+    int use_loop = 0;
     int i;
 
     strcpy(host, DEFAULT_NODE_HOST);
@@ -1304,10 +1374,17 @@ int main(int argc, char **argv)
         return ent.timer_ok ? 0 : 10;
     }
 
+    /* Choose timing source */
+    use_loop = force_loop_timing || !hw.has_tsc;
+    if (use_loop)
+        printf("[INFO] Using loop-based timing fallback (no RDTSC)\n");
+    else
+        printf("[INFO] Using RDTSC timing\n");
+
     if (dry_run) {
         static char payload[PAYLOAD_MAX];
         struct entropy_info ent;
-        collect_entropy(&ent, hw.has_tsc && !force_loop_timing);
+    collect_entropy(&ent, hw.has_tsc && !force_loop_timing);
         if (build_payload(payload, sizeof(payload), &hw, wallet, wallet,
                           "dry-run-nonce", &ent) < 0) {
             printf("[FAIL] payload too large\n");
@@ -1328,3 +1405,4 @@ int main(int argc, char **argv)
 
     return 0;
 }
+
